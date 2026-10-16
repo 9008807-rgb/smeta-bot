@@ -23,6 +23,7 @@ On the first start with an empty DATA_DIR the bot restores state and leads from 
 import csv, json, mimetypes, os, sys, time, urllib.error, urllib.parse, urllib.request, uuid
 from pathlib import Path
 
+VERSION = "v3 coloured buttons"  # shows in the start log line: tells which code the host really runs
 HERE = Path(__file__).parent
 CFG = json.loads((HERE / "config.json").read_text(encoding="utf-8"))
 TOKEN = (os.environ.get("BOT_TOKEN") or (HERE / "token.txt").read_text(encoding="utf-8-sig")).strip()
@@ -355,7 +356,7 @@ def main():
     me = call("getMe")
     restore_from_telegram()
     state = load_state()
-    log("bot @%s started, data in %s, %d users" % (me["username"], DATA, len(state["users"])))
+    log("bot @%s started (%s), data in %s, %d users" % (me["username"], VERSION, DATA, len(state["users"])))
     last_fu = 0
     while True:
         try:
