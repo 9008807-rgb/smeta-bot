@@ -123,8 +123,15 @@ def ack(cq):
         log("ack failed", e)
 
 
+def button_style(data):
+    # grey default buttons read as plain text in a chat; coloured ones look tappable.
+    # green = the step we want (consultation, its time slot), blue = everything else
+    return "success" if data == "consult" or data.startswith("slot:") else "primary"
+
+
 def kb(rows):
-    return {"inline_keyboard": [[{"text": t, **({"url": d} if d.startswith("http") else {"callback_data": d})}
+    return {"inline_keyboard": [[{"text": t, "style": button_style(d),
+                                  **({"url": d} if d.startswith("http") else {"callback_data": d})}
                                  for t, d in row] for row in rows]}
 
 
@@ -198,7 +205,7 @@ def user(state, chat):
 def on_consult(chat, state):
     user(state, chat)["await_phone"] = True
     call("sendMessage", chat_id=chat, text=TEXT["ask_phone"],
-         reply_markup={"keyboard": [[{"text": "📱 Отправить номер", "request_contact": True}]],
+         reply_markup={"keyboard": [[{"text": "📱 Отправить номер", "request_contact": True, "style": "success"}]],
                        "resize_keyboard": True, "one_time_keyboard": True})
 
 
