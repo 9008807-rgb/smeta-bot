@@ -1,0 +1,13 @@
+# secrets and personal data never go to Git
+token.txt
+admin_code.txt
+state.json
+state.tmp
+leads.csv
+bot.log
+# local-only stuff
+*.bak
+__pycache__/
+cover/
+deploy/
+start_bot.bat*
