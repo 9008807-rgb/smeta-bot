@@ -1,4 +1,4 @@
-"""Telegram bot: lead magnet «Смета запуска бренда одежды» for the course «Бренд под ключ».
+﻿"""Telegram bot: lead magnet «Смета запуска бренда одежды» for the course «Бренд под ключ».
 
 - /start [source]  -> sends the smeta (xlsx + pdf), asks the stage, logs the lead with its source
                       (deep link t.me/<bot>?start=clip01 lets us see which clip or ad brought the lead)
@@ -23,7 +23,7 @@ On the first start with an empty DATA_DIR the bot restores state and leads from 
 import csv, json, mimetypes, os, sys, time, urllib.error, urllib.parse, urllib.request, uuid
 from pathlib import Path
 
-VERSION = "v3 coloured buttons"  # shows in the start log line: tells which code the host really runs
+VERSION = "v4 real file names"  # shows in the start log line: tells which code the host really runs
 HERE = Path(__file__).parent
 CFG = json.loads((HERE / "config.json").read_text(encoding="utf-8"))
 TOKEN = (os.environ.get("BOT_TOKEN") or (HERE / "token.txt").read_text(encoding="utf-8-sig")).strip()
@@ -98,9 +98,10 @@ def send_file(chat, path, caption, state, kind="document", markup=None, meta=Non
     for k, v in fields.items():
         parts.append(f'--{b}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode())
     ctype = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-    fname = urllib.parse.quote(path.name)
-    parts.append((f'--{b}\r\nContent-Disposition: form-data; name="{kind}"; filename="file{path.suffix}"; '
-                  f"filename*=UTF-8''{fname}\r\nContent-Type: {ctype}\r\n\r\n").encode() + path.read_bytes() + b"\r\n")
+    # Telegram takes the plain filename and ignores filename*: a placeholder there showed up as "file.pdf"
+    fname = path.name.replace('"', "'")
+    parts.append((f'--{b}\r\nContent-Disposition: form-data; name="{kind}"; filename="{fname}"\r\n'
+                  f"Content-Type: {ctype}\r\n\r\n").encode() + path.read_bytes() + b"\r\n")
     parts.append(f"--{b}--\r\n".encode())
     req = urllib.request.Request(API + method, data=b"".join(parts),
                                  headers={"Content-Type": f"multipart/form-data; boundary={b}"})
@@ -174,7 +175,7 @@ def on_start(msg, state):
     u.setdefault("source", source)
     first = fr.get("first_name") or ""
     call("sendMessage", chat_id=chat, text=TEXT["hello"].format(name_sep=f", {first}" if first else ""))
-    for p in sorted((HERE / "files").glob("*")):
+    for p in sorted((HERE / "files").glob("*"), key=lambda p: (p.suffix != ".pdf", p.name)):  # PDF first
         send_file(chat, p, TEXT["file_caption"], state)
     call("sendMessage", chat_id=chat, text=TEXT["ask_stage"],
          reply_markup=kb([[(t, "stage:" + k)] for k, t in TEXT["stages"].items()]))
