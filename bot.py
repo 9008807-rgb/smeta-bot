@@ -17,6 +17,9 @@
                       allowed to post. /plan, /postnow <id>, /hold <id>, /unhold <id> for admins
 - /broadcast       -> admins only: message (any kind) -> audience segment -> preview -> send to bot subscribers
                       in chunks from the main loop (queue kept in state), report at the end; /cancel aborts
+- Instagram        -> instagram.py: reels and carousels from ig_posts.json at their Moscow time, private replies
+                      to comment keywords (СМЕТА, КУРС). /igtoken <token> connects the account, /ig shows the plan;
+                      /postnow, /hold, /unhold take ig.. ids too
 
 No third-party packages: plain Bot API over urllib, long polling. State lives in state.json, leads in leads.csv.
 
@@ -28,7 +31,10 @@ On the first start with an empty DATA_DIR the bot restores state and leads from 
 import csv, json, mimetypes, os, sys, time, urllib.error, urllib.parse, urllib.request, uuid
 from pathlib import Path
 
-VERSION = "v9 broadcast"  # shows in the start log line: tells which code the host really runs
+sys.path.insert(0, str(Path(__file__).parent))  # python -I leaves the script folder out of sys.path
+import instagram as ig  # noqa: E402
+
+VERSION = "v10 instagram"  # shows in the start log line: tells which code the host really runs
 HERE = Path(__file__).parent
 CFG = json.loads((HERE / "config.json").read_text(encoding="utf-8"))
 TOKEN = (os.environ.get("BOT_TOKEN") or (HERE / "token.txt").read_text(encoding="utf-8-sig")).strip()
@@ -428,6 +434,7 @@ def plan(state):
 
 
 ADMIN_MENU = [("start", "Получить смету"), ("plan", "Расписание постов в канал"),
+              ("ig", "Instagram: расписание и ответы"),
               ("broadcast", "Рассылка подписчикам бота"), ("stats", "Статистика заявок"),
               ("backup", "Прислать базу и заявки"),
               ("hold", "Пауза поста: /hold p05"), ("unhold", "Снять паузу: /unhold p05"),
@@ -447,7 +454,14 @@ def set_admin_menu(state):
 def admin_post_cmd(text, chat, state):
     cmd, _, pid = text.partition(" ")
     pid = pid.strip()
-    p = next((x for x in POSTS["posts"] if x["id"] == pid), None)
+    p = next((x for x in POSTS["posts"] + ig.IG["posts"] if x["id"] == pid), None)
+    if p and pid.startswith("ig") and cmd == "/postnow":
+        try:
+            reply = ig.publish_now(p, state)
+        except Exception as e:
+            reply = f"Instagram: не получилось — {str(e)[:300]}"
+        call("sendMessage", chat_id=chat, text=reply)
+        return
     if not p:
         # picked from the menu without a number: explain and show what can be picked
         call("sendMessage", chat_id=chat, text=f"Напишите команду с номером поста, например: {cmd} p05\n\n" + plan(state))
@@ -618,6 +632,22 @@ def handle(upd, state):
         call("sendMessage", chat_id=chat, text=stats(state))
     elif text.startswith("/plan") and chat in admins(state):
         call("sendMessage", chat_id=chat, text=plan(state))
+    elif text.startswith("/igtoken") and chat in admins(state):
+        # the token is a password to the account: take it and remove the message from the chat history
+        try:
+            call("deleteMessage", chat_id=chat, message_id=msg["message_id"])
+        except Exception as e:
+            log("igtoken delete failed", e)
+        tok = text.partition(" ")[2].strip()
+        try:
+            name = ig.set_token(state, tok)
+            reply = (f"Instagram подключён: @{name}. Токен сохранён, сообщение с ним я удалил. "
+                     "Расписание: /ig")
+        except Exception as e:
+            reply = f"Токен не подошёл: {str(e)[:300]}"
+        call("sendMessage", chat_id=chat, text=reply)
+    elif text.split(" ")[0] == "/ig" and chat in admins(state):
+        call("sendMessage", chat_id=chat, text=ig.plan(state))
     elif text.split(" ")[0] in ("/postnow", "/hold", "/unhold") and chat in admins(state):
         admin_post_cmd(text, chat, state)
     elif text.startswith("/backup") and chat in admins(state):
@@ -637,6 +667,7 @@ def main():
     me = call("getMe")
     restore_from_telegram()
     state = load_state()
+    ig.init(log, notify_admin)
     set_admin_menu(state)
     log("bot @%s started (%s), data in %s, %d users" % (me["username"], VERSION, DATA, len(state["users"])))
     last_fu = 0
@@ -654,6 +685,7 @@ def main():
                 followups(state)
                 last_fu = time.time()
             channel_posts(state)
+            ig.tick(state)
             bc_tick(state)
             save_state(state)
         except Exception as e:
