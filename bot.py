@@ -26,7 +26,7 @@ On the first start with an empty DATA_DIR the bot restores state and leads from 
 import csv, json, mimetypes, os, sys, time, urllib.error, urllib.parse, urllib.request, uuid
 from pathlib import Path
 
-VERSION = "v6 owners always admins"  # shows in the start log line: tells which code the host really runs
+VERSION = "v7 admin menu"  # shows in the start log line: tells which code the host really runs
 HERE = Path(__file__).parent
 CFG = json.loads((HERE / "config.json").read_text(encoding="utf-8"))
 TOKEN = (os.environ.get("BOT_TOKEN") or (HERE / "token.txt").read_text(encoding="utf-8-sig")).strip()
@@ -408,12 +408,29 @@ def plan(state):
             + "\n\n/postnow p01 — опубликовать сейчас, /hold p01 — пауза, /unhold p01 — снять паузу")
 
 
+ADMIN_MENU = [("start", "Получить смету"), ("plan", "Расписание постов в канал"),
+              ("stats", "Статистика заявок"), ("backup", "Прислать базу и заявки"),
+              ("hold", "Пауза поста: /hold p05"), ("unhold", "Снять паузу: /unhold p05"),
+              ("postnow", "Опубликовать сейчас: /postnow p05"), ("stop", "Не присылать сообщения")]
+
+
+def set_admin_menu(state):
+    """the "/" menu next to the input field: admins see their commands, everyone else keeps /start and /stop"""
+    for chat in admins(state):
+        try:
+            call("setMyCommands", commands=[{"command": c, "description": d} for c, d in ADMIN_MENU],
+                 scope={"type": "chat", "chat_id": chat})
+        except Exception as e:
+            log("admin menu failed", chat, e)
+
+
 def admin_post_cmd(text, chat, state):
     cmd, _, pid = text.partition(" ")
     pid = pid.strip()
     p = next((x for x in POSTS["posts"] if x["id"] == pid), None)
     if not p:
-        call("sendMessage", chat_id=chat, text="Нет такого поста. Список: /plan")
+        # picked from the menu without a number: explain and show what can be picked
+        call("sendMessage", chat_id=chat, text=f"Напишите команду с номером поста, например: {cmd} p05\n\n" + plan(state))
         return
     held, unheld = state.setdefault("held", []), state.setdefault("unheld", [])
     if cmd == "/hold":
@@ -472,6 +489,7 @@ def handle(upd, state):
                 state["admins_off"].remove(chat)
             if chat not in admins(state):
                 admins(state).append(chat)
+            set_admin_menu(state)
             call("sendMessage", chat_id=chat, text="Готово: заявки будут приходить сюда. "
                                                    f"Всего получателей: {len(admins(state))}. Отключить: /admin_off")
     elif text.startswith("/stats") and chat in admins(state):
@@ -497,6 +515,7 @@ def main():
     me = call("getMe")
     restore_from_telegram()
     state = load_state()
+    set_admin_menu(state)
     log("bot @%s started (%s), data in %s, %d users" % (me["username"], VERSION, DATA, len(state["users"])))
     last_fu = 0
     while True:
