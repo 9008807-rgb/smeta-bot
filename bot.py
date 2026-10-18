@@ -1,4 +1,4 @@
-﻿"""Telegram bot: lead magnet «Смета запуска бренда одежды» for the course «Бренд под ключ».
+"""Telegram bot: lead magnet «Смета запуска бренда одежды» for the course «Бренд под ключ».
 
 - /start [source]  -> sends the smeta (xlsx + pdf), asks the stage, logs the lead with its source
                       (deep link t.me/<bot>?start=clip01 lets us see which clip or ad brought the lead)
@@ -26,7 +26,7 @@ On the first start with an empty DATA_DIR the bot restores state and leads from 
 import csv, json, mimetypes, os, sys, time, urllib.error, urllib.parse, urllib.request, uuid
 from pathlib import Path
 
-VERSION = "v5 channel autopost"  # shows in the start log line: tells which code the host really runs
+VERSION = "v6 owners always admins"  # shows in the start log line: tells which code the host really runs
 HERE = Path(__file__).parent
 CFG = json.loads((HERE / "config.json").read_text(encoding="utf-8"))
 TOKEN = (os.environ.get("BOT_TOKEN") or (HERE / "token.txt").read_text(encoding="utf-8-sig")).strip()
@@ -162,6 +162,11 @@ def admins(state):
     old = state.pop("admin_chat", None)
     if old and old not in lst:
         lst.append(old)
+    # owners listed in config.json are admins even if state.json is lost or reset on the host
+    # (chat ids are not secret; /admin <code> stays for adding someone new)
+    for c in CFG.get("admins", []):
+        if c not in lst and c not in state.get("admins_off", []):
+            lst.append(c)
     return lst
 
 
@@ -459,9 +464,12 @@ def handle(upd, state):
     elif text.startswith("/admin_off"):
         if chat in admins(state):
             admins(state).remove(chat)
+            state.setdefault("admins_off", []).append(chat)
             call("sendMessage", chat_id=chat, text="Заявки сюда больше не приходят.")
     elif text.startswith("/admin"):
         if ADMIN_CODE and text.split()[-1] == ADMIN_CODE:
+            if chat in state.get("admins_off", []):
+                state["admins_off"].remove(chat)
             if chat not in admins(state):
                 admins(state).append(chat)
             call("sendMessage", chat_id=chat, text="Готово: заявки будут приходить сюда. "

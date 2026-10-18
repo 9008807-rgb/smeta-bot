@@ -15,8 +15,12 @@ bot.call = lambda m, _http_timeout=70, **p: sent.append((m, p)) or {"document": 
 def fake_send(chat, path, cap, st, kind="document", markup=None, meta=None, parse_mode=None):
     assert path.exists(), path
     sent.append(("send_" + kind, {"chat_id": chat, "file": path.name, "markup": markup}))
-    return {kind: {"file_id": "X"}}
+    return {kind: {"file_id": "X"}, "message_id": 700}
 bot.send_file = fake_send
+owners = bot.CFG.get("admins", [])
+assert owners, "config.json must list the owners' chat ids"
+assert bot.admins({"users": {}}) == owners             # host lost state.json: owners are still admins
+bot.CFG["admins"] = []                                 # the rest of the test registers admins by code
 st = bot.load_state()
 u = {"id": 1, "first_name": "Оля", "username": "olya"}
 bot.handle({"message": {"chat": {"id": 1}, "from": u, "text": "/start clip01"}}, st)
