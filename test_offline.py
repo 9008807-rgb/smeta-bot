@@ -160,6 +160,42 @@ assert len(to_b) == 1 and "start=m4ch" in to_b[0]["text"] and "utm_medium=m4ch" 
 assert to_b[0]["reply_markup"]["inline_keyboard"][0][0]["url"].endswith("start=m4ch")
 assert sum(1 for m, p in sent if p.get("chat_id") == "@a") == 1 and set(stc4["posted"]) == {"p01@a", "p01@b"}
 print("channel autopost ok")
+
+# broadcast: draft -> segment -> preview -> queued send in chunks -> report; blocked users get stopped
+sent.clear()
+def bc_call(m, _http_timeout=70, **p):
+    sent.append((m, p))
+    if m == "copyMessage" and p["chat_id"] == 13:
+        raise RuntimeError("copyMessage: 403 Forbidden: bot was blocked by the user")
+    return {"message_id": 5}
+bot.call = bc_call
+sb = {"users": {str(i): {"id": i, "stage": s, "source": src} for i, s, src in
+                [(11, "dream", "tg"), (12, "brand", "m4ch"), (13, "idea", "vk_1"), (14, "samples", "tg")]},
+      "file_ids": {}, "admin_chats": [99]}
+sb["users"]["15"] = {"id": 15, "stage": "dream", "stopped": True}
+assert bot.segment(sb, "all") == [11, 12, 13, 14] and bot.segment(sb, "new") == [11, 13, 14]
+assert bot.segment(sb, "brand") == [12] and bot.segment(sb, "tg") == [11, 14] and bot.segment(sb, "vk") == [13]
+bot.handle({"message": {"chat": {"id": 1}, "from": {}, "text": "/broadcast"}}, sb)       # not an admin
+assert not sb.get("bc_draft")
+bot.handle({"message": {"chat": {"id": 99}, "from": {}, "text": "/broadcast"}}, sb)
+bot.handle({"message": {"chat": {"id": 99}, "message_id": 777, "from": {}, "text": "Скидка до пятницы"}}, sb)
+assert sb["bc_draft"]["99"] == {"step": "segment", "msg": 777}
+cq = lambda d: {"callback_query": {"id": "c", "data": d, "message": {"chat": {"id": 99}}}}
+bot.handle(cq("bc:seg:new"), sb)
+assert any(m == "copyMessage" and p["chat_id"] == 99 for m, p in sent)                     # preview to the admin
+assert not sb.get("bc_queue")                                                               # nothing sent yet
+bot.handle(cq("bc:send"), sb)
+assert sb["bc_queue"][0]["todo"] == [11, 13, 14] and "99" not in sb["bc_draft"]
+bot.BC_CHUNK = 2
+bot.bc_tick(sb); assert sb["bc_queue"][0]["todo"] == [14]
+bot.bc_tick(sb); assert not sb["bc_queue"]
+got = [p["chat_id"] for m, p in sent if m == "copyMessage" and p["chat_id"] != 99]
+assert got == [11, 13, 14] and sb["users"]["13"]["stopped"]
+assert any("доставлено 2 из 3, заблокировали бота 1" in p.get("text", "") for m, p in sent)
+bot.handle({"message": {"chat": {"id": 99}, "from": {}, "text": "/broadcast"}}, sb)
+bot.handle({"message": {"chat": {"id": 99}, "from": {}, "text": "/cancel"}}, sb)
+assert "99" not in sb["bc_draft"]
+print("broadcast ok")
 # the real schedule parses and every clip file exists
 real = json.loads((bot.HERE / "posts.json").read_text(encoding="utf-8"))
 for p in real["posts"]:

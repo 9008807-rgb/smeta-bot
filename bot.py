@@ -15,6 +15,8 @@
 - channel autopost -> publishes posts.json (texts, clips, a poll) to the course channel at their Moscow time;
                       admins get a preview a day before and a link after. The bot must be a channel admin
                       allowed to post. /plan, /postnow <id>, /hold <id>, /unhold <id> for admins
+- /broadcast       -> admins only: message (any kind) -> audience segment -> preview -> send to bot subscribers
+                      in chunks from the main loop (queue kept in state), report at the end; /cancel aborts
 
 No third-party packages: plain Bot API over urllib, long polling. State lives in state.json, leads in leads.csv.
 
@@ -26,7 +28,7 @@ On the first start with an empty DATA_DIR the bot restores state and leads from 
 import csv, json, mimetypes, os, sys, time, urllib.error, urllib.parse, urllib.request, uuid
 from pathlib import Path
 
-VERSION = "v8 two channels"  # shows in the start log line: tells which code the host really runs
+VERSION = "v9 broadcast"  # shows in the start log line: tells which code the host really runs
 HERE = Path(__file__).parent
 CFG = json.loads((HERE / "config.json").read_text(encoding="utf-8"))
 TOKEN = (os.environ.get("BOT_TOKEN") or (HERE / "token.txt").read_text(encoding="utf-8-sig")).strip()
@@ -426,7 +428,8 @@ def plan(state):
 
 
 ADMIN_MENU = [("start", "Получить смету"), ("plan", "Расписание постов в канал"),
-              ("stats", "Статистика заявок"), ("backup", "Прислать базу и заявки"),
+              ("broadcast", "Рассылка подписчикам бота"), ("stats", "Статистика заявок"),
+              ("backup", "Прислать базу и заявки"),
               ("hold", "Пауза поста: /hold p05"), ("unhold", "Снять паузу: /unhold p05"),
               ("postnow", "Опубликовать сейчас: /postnow p05"), ("stop", "Не присылать сообщения")]
 
@@ -470,10 +473,101 @@ def admin_post_cmd(text, chat, state):
         call("sendMessage", chat_id=chat, text="Опубликовано:\n" + "\n".join(links))
 
 
+# --- broadcast to everyone who started the bot (Telegram never lets a bot write to channel subscribers) ---
+SEGMENTS = [("all", "Всем"), ("new", "Новичкам: мечта, идея, образцы"), ("brand", "У кого бренд уже продаёт"),
+            ("nophone", "Кто ещё не оставил заявку"), ("tg", "Пришли из канала Анны"),
+            ("m4ch", "Пришли из канала производства"), ("vk", "Пришли из рекламы VK")]
+BC_CHUNK = 25  # messages per loop turn; with getUpdates timeout 0 that is ~20/s, under Telegram's 30/s limit
+
+
+def segment(state, key):
+    out = []
+    for u in state["users"].values():
+        if u.get("stopped"):
+            continue
+        src, stage = u.get("source", ""), u.get("stage", "")
+        if (key == "all" or key == "new" and stage in ("dream", "idea", "samples") or key == "brand" and stage == "brand"
+                or key == "nophone" and not u.get("phone") or key == "tg" and src == "tg"
+                or key == "m4ch" and src == "m4ch" or key == "vk" and src.startswith("vk")):
+            out.append(u["id"])
+    return out
+
+
+def bc_start(chat, state):
+    state.setdefault("bc_draft", {})[str(chat)] = {"step": "content"}
+    call("sendMessage", chat_id=chat, text="Пришлите сообщение для рассылки: текст, фото или видео с подписью. "
+                                           "Оно уйдёт подписчикам бота в точности как вы его пришлёте.\n\nОтмена: /cancel")
+
+
+def bc_content(msg, state):
+    chat = msg["chat"]["id"]
+    state["bc_draft"][str(chat)] = {"step": "segment", "msg": msg["message_id"]}
+    rows = [[(f"{t} — {len(segment(state, k))}", "bc:seg:" + k)] for k, t in SEGMENTS]
+    call("sendMessage", chat_id=chat, text="Кому отправить? Цифра — сколько человек получит.",
+         reply_markup=kb(rows + [[("Отмена", "bc:cancel")]]))
+
+
+def bc_callback(cq, state):
+    chat, data = cq["message"]["chat"]["id"], cq["data"]
+    ack(cq)
+    draft = state.setdefault("bc_draft", {}).get(str(chat))
+    if chat not in admins(state):
+        return
+    if data == "bc:cancel" or not draft:
+        state["bc_draft"].pop(str(chat), None)
+        call("sendMessage", chat_id=chat, text="Рассылка отменена.")
+        return
+    if data.startswith("bc:seg:"):
+        key = data.split(":", 2)[2]
+        n = len(segment(state, key))
+        draft.update(step="confirm", seg=key)
+        call("sendMessage", chat_id=chat, text="Превью — так увидят подписчики:")
+        call("copyMessage", chat_id=chat, from_chat_id=chat, message_id=draft["msg"])
+        call("sendMessage", chat_id=chat, text=f"Аудитория: {dict(SEGMENTS)[key]}. Получат {n} чел.",
+             reply_markup=kb([[(f"Отправить {n} чел.", "bc:send")], [("Отмена", "bc:cancel")]]))
+    elif data == "bc:send" and draft.get("step") == "confirm":
+        ids = segment(state, draft["seg"])
+        state.setdefault("bc_queue", []).append({"admin": chat, "from": chat, "msg": draft["msg"], "todo": ids,
+                                                 "ok": 0, "blocked": 0, "failed": 0, "total": len(ids)})
+        state["bc_draft"].pop(str(chat), None)
+        call("sendMessage", chat_id=chat, text=f"Отправляю {len(ids)} чел. Пришлю отчёт, когда закончу.")
+
+
+def bc_tick(state):
+    """send the next chunk of the current broadcast; the queue lives in state, so a restart resumes it"""
+    q = state.get("bc_queue") or []
+    if not q:
+        return
+    job = q[0]
+    for _ in range(min(BC_CHUNK, len(job["todo"]))):
+        uid = job["todo"].pop(0)
+        try:
+            call("copyMessage", chat_id=uid, from_chat_id=job["from"], message_id=job["msg"])
+            job["ok"] += 1
+        except Exception as e:
+            if "blocked" in str(e) or "chat not found" in str(e) or "deactivated" in str(e):
+                job["blocked"] += 1
+                state["users"].get(str(uid), {})["stopped"] = True
+            elif "429" in str(e):           # too fast: put the user back and wait for the next turn
+                job["todo"].insert(0, uid)
+                time.sleep(5)
+                break
+            else:
+                job["failed"] += 1
+                log("broadcast failed", uid, str(e)[:200])
+        time.sleep(0.05)
+    if not job["todo"]:
+        q.pop(0)
+        call("sendMessage", chat_id=job["admin"], text=f"Рассылка готова: доставлено {job['ok']} из {job['total']}, "
+                                                       f"заблокировали бота {job['blocked']}, ошибок {job['failed']}.")
+
+
 def handle(upd, state):
     if "callback_query" in upd:
         cq = upd["callback_query"]
-        if cq["data"].startswith("stage:"):
+        if cq["data"].startswith("bc:"):
+            bc_callback(cq, state)
+        elif cq["data"].startswith("stage:"):
             on_stage(cq, state)
         elif cq["data"].startswith("obj:"):
             on_objection(cq, state)
@@ -488,7 +582,15 @@ def handle(upd, state):
         return
     chat, text = msg["chat"]["id"], msg.get("text", "")
     waiting = state["users"].get(str(chat), {}).get("await_phone") and text and not text.startswith("/")
-    if "contact" in msg:
+    draft = state.get("bc_draft", {}).get(str(chat))
+    if text.startswith("/cancel") and draft:
+        state["bc_draft"].pop(str(chat))
+        call("sendMessage", chat_id=chat, text="Рассылка отменена.")
+    elif draft and draft["step"] == "content" and not text.startswith("/"):
+        bc_content(msg, state)
+    elif text.startswith("/broadcast") and chat in admins(state):
+        bc_start(chat, state)
+    elif "contact" in msg:
         on_contact(msg, state)
     elif waiting and parse_phone(text):
         on_contact(msg, state, parse_phone(text))
@@ -540,7 +642,8 @@ def main():
     last_fu = 0
     while True:
         try:
-            ups = call("getUpdates", _http_timeout=70, offset=state["offset"], timeout=50)
+            busy = bool(state.get("bc_queue"))  # while a broadcast runs, do not wait 50 s for updates
+            ups = call("getUpdates", _http_timeout=70, offset=state["offset"], timeout=0 if busy else 50)
             for upd in ups:
                 state["offset"] = upd["update_id"] + 1
                 try:
@@ -551,6 +654,7 @@ def main():
                 followups(state)
                 last_fu = time.time()
             channel_posts(state)
+            bc_tick(state)
             save_state(state)
         except Exception as e:
             log("loop error", repr(e)[:300])
