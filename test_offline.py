@@ -111,11 +111,11 @@ t01 = bot.post_time(bot.POSTS["posts"][0])
 assert time.strftime("%Y-%m-%d %H:%M", time.gmtime(t01 + 3 * 3600)) == "2026-10-26 12:00"
 bot.channel_posts(stc, now=t01 - 20 * 3600)                     # day before: previews only
 assert not stc["posted"] and stc["previewed"] == ["p01"]          # p02 is 27 h away: no preview yet
-assert any("Завтра в канале" in p.get("text", "") for m, p in sent)
+assert any("Завтра в @chan" in p.get("text", "") for m, p in sent)
 bot.channel_posts(stc, now=t01 + 60)                            # 12:01: the text goes out with HTML and a button
 m, p = next((m, p) for m, p in sent if p.get("chat_id") == "@chan")
 assert m == "sendMessage" and p["parse_mode"] == "HTML" and p["reply_markup"]["inline_keyboard"][0][0]["url"] == "https://t.me/x"
-assert "p01" in stc["posted"] and "p02" not in stc["posted"]
+assert "p01@chan" in stc["posted"] and "p02@chan" not in stc["posted"]
 assert any("t.me/chan/" in p.get("text", "") for m, p in sent)  # admins get the link
 bot.channel_posts(stc, now=bot.post_time(bot.POSTS["posts"][1]) + 60)
 assert any(m == "send_video" and p["chat_id"] == "@chan" for m, p in sent)
@@ -124,15 +124,15 @@ bot.channel_posts(stc, now=t03 + 60)
 poll = next(p for m, p in sent if m == "sendPoll")
 assert poll["options"] == [{"text": "А"}, {"text": "Б"}]
 bot.channel_posts(stc, now=t03 + 7200)                          # p04 is on hold: not published
-assert "p04" not in stc["posted"]
+assert "p04@chan" not in stc["posted"]
 assert "⏸" in bot.plan(stc) and "p04" in bot.plan(stc)
 bot.admin_post_cmd("/unhold p04", 99, stc)
 bot.channel_posts(stc, now=t03 + 7200)
-assert "p04" in stc["posted"]
+assert "p04@chan" in stc["posted"]
 # a post that is 13 h late is reported, not published
 st2 = {"users": {}, "file_ids": {}, "admin_chats": [99]}
 bot.channel_posts(st2, now=t01 + 13 * 3600)
-assert st2["posted"]["p01"] == "missed"
+assert st2["posted"]["p01@chan"] == "missed"
 # failure: reported once, retried after 10 minutes
 st3 = {"users": {}, "file_ids": {}, "admin_chats": [99]}
 calls = []
@@ -145,9 +145,20 @@ bot.call = failing
 bot.channel_posts(st3, now=t01 + 60); bot.channel_posts(st3, now=t01 + 120)
 tries = lambda: sum(1 for c in calls if c[1] == "@chan")
 notices = lambda: sum(1 for c in calls if c[2].startswith("Не получилось"))
-assert tries() == 1 and notices() == 1 and st3["post_failed"] == ["p01"]   # retry waits 10 min, one notice
+assert tries() == 1 and notices() == 1 and st3["post_failed"] == ["p01@chan"]   # retry waits 10 min, one notice
 bot.channel_posts(st3, now=t01 + 700)
 assert tries() == 2 and notices() == 1                                   # retried, no second notice
+# two channels: each gets the post once, links carry the channel's own source tag
+bot.call = lambda m, _http_timeout=70, **p: sent.append((m, p)) or {"message_id": 900}
+bot.POSTS = {"channels": [{"chat": "@a", "tag": "tg"}, {"chat": "@b", "tag": "m4ch"}], "posts": [
+    {"id": "p01", "at": "2026-10-26 12:00", "title": "Т", "text": "смета https://t.me/x?start=tg курс https://c?utm_medium=channel",
+     "buttons": [["Смета", "https://t.me/x?start=tg"]]}]}
+sent.clear(); stc4 = {"users": {}, "file_ids": {}, "admin_chats": [99]}
+bot.channel_posts(stc4, now=t01 + 60); bot.channel_posts(stc4, now=t01 + 900)
+to_b = [p for m, p in sent if p.get("chat_id") == "@b"]
+assert len(to_b) == 1 and "start=m4ch" in to_b[0]["text"] and "utm_medium=m4ch" in to_b[0]["text"]
+assert to_b[0]["reply_markup"]["inline_keyboard"][0][0]["url"].endswith("start=m4ch")
+assert sum(1 for m, p in sent if p.get("chat_id") == "@a") == 1 and set(stc4["posted"]) == {"p01@a", "p01@b"}
 print("channel autopost ok")
 # the real schedule parses and every clip file exists
 real = json.loads((bot.HERE / "posts.json").read_text(encoding="utf-8"))

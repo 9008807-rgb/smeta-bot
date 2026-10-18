@@ -26,7 +26,7 @@ On the first start with an empty DATA_DIR the bot restores state and leads from 
 import csv, json, mimetypes, os, sys, time, urllib.error, urllib.parse, urllib.request, uuid
 from pathlib import Path
 
-VERSION = "v7 admin menu"  # shows in the start log line: tells which code the host really runs
+VERSION = "v8 two channels"  # shows in the start log line: tells which code the host really runs
 HERE = Path(__file__).parent
 CFG = json.loads((HERE / "config.json").read_text(encoding="utf-8"))
 TOKEN = (os.environ.get("BOT_TOKEN") or (HERE / "token.txt").read_text(encoding="utf-8-sig")).strip()
@@ -320,73 +320,89 @@ def post_time(p):
     return calendar.timegm(time.strptime(p["at"], "%Y-%m-%d %H:%M")) - MSK
 
 
-def channel_link(msg_id):
-    ch = POSTS["channel"]
-    return f"https://t.me/{ch.lstrip('@')}/{msg_id}" if ch.startswith("@") else str(msg_id)
+def channels():
+    """[{"chat": "@name", "tag": "tg"}]; the tag replaces start=tg / utm_medium=channel in the links,
+    so /stats and the site analytics show which channel brought the lead"""
+    return POSTS.get("channels") or [{"chat": POSTS["channel"], "tag": "tg"}]
 
 
-def publish(p, state):
-    """send one scheduled post to the channel, return the message id"""
-    ch = POSTS["channel"]
-    markup = kb([[(t, u)] for t, u in p.get("buttons", [])]) if p.get("buttons") else None
+def channel_link(chat, msg_id):
+    return f"https://t.me/{chat.lstrip('@')}/{msg_id}" if str(chat).startswith("@") else str(msg_id)
+
+
+def retag(s, tag):
+    return s.replace("start=tg", "start=" + tag).replace("utm_medium=channel", "utm_medium=" + tag)
+
+
+def publish(p, state, ch=None, tag="tg"):
+    """send one scheduled post to a channel, return the message id"""
+    ch = ch or channels()[0]["chat"]
+    text = retag(p.get("text", ""), tag)
+    markup = kb([[(t, retag(u, tag))] for t, u in p.get("buttons", [])]) if p.get("buttons") else None
     if p.get("poll"):
         r = call("sendPoll", chat_id=ch, question=p["poll"]["question"],
                  options=[{"text": o} for o in p["poll"]["options"]], is_anonymous="true")
     elif p.get("video_file_id"):
         # clips live in Telegram (uploaded once by deploy/build_posts.py), not in the repo
         extra = {"reply_markup": markup} if markup else {}
-        r = call("sendVideo", chat_id=ch, video=p["video_file_id"], caption=p["text"], parse_mode="HTML",
+        r = call("sendVideo", chat_id=ch, video=p["video_file_id"], caption=text, parse_mode="HTML",
                  supports_streaming="true", **{k: str(v) for k, v in p.get("video_meta", {}).items()}, **extra)
     elif p.get("video"):
-        r = send_file(ch, HERE / "video" / p["video"], p["text"], state, "video", markup, p.get("video_meta"),
+        r = send_file(ch, HERE / "video" / p["video"], text, state, "video", markup, p.get("video_meta"),
                       parse_mode="HTML")
     else:
         extra = {"reply_markup": markup} if markup else {}
-        r = call("sendMessage", chat_id=ch, text=p["text"], parse_mode="HTML",
+        r = call("sendMessage", chat_id=ch, text=text, parse_mode="HTML",
                  link_preview_options={"is_disabled": True}, **extra)
     return r["message_id"]
 
 
+def is_held(p, state):
+    return (p.get("hold") and p["id"] not in state.get("unheld", [])) or p["id"] in state.get("held", [])
+
+
 def channel_posts(state, now=None):
-    """publish what is due, warn admins a day ahead, report failures once per post"""
+    """publish what is due in every channel, warn admins a day ahead, report failures once per post and channel"""
     now = now or time.time()
-    posted, held = state.setdefault("posted", {}), state.setdefault("held", [])
+    posted = state.setdefault("posted", {})          # "p01@anyazheltakova" -> message id or "missed"
     previewed, failed = state.setdefault("previewed", []), state.setdefault("post_failed", [])
+    retry = state.setdefault("post_retry", {})
+    names = ", ".join(c["chat"] for c in channels())
     for p in POSTS["posts"]:
-        pid = p["id"]
-        if pid in posted:
-            continue
-        on_hold = p.get("hold") and pid not in state.setdefault("unheld", []) or pid in held
-        t = post_time(p)
+        pid, t = p["id"], post_time(p)
+        on_hold = is_held(p, state)
         if t - now <= 24 * 3600 and pid not in previewed and now < t:
             previewed.append(pid)
             note = ("⚠️ Пост на паузе: нужны данные от Анны. Опубликовать: /unhold " + pid) if on_hold else \
                    ("Снять с публикации: /hold " + pid)
-            notify_admin(state, f"Завтра в канале, {p['at']} МСК: {p['title']}\n\n{strip_html(p.get('text', ''))[:600]}"
-                                f"\n\n{note}")
+            notify_admin(state, f"Завтра в {names}, {p['at']} МСК: {p['title']}\n\n"
+                                f"{strip_html(p.get('text', ''))[:600]}\n\n{note}")
         if now < t or on_hold:
             continue
-        if now - t > LATE_LIMIT:
-            posted[pid] = "missed"
-            notify_admin(state, f"Пост {pid} «{p['title']}» не вышел вовремя ({p['at']} МСК) и пропущен. "
-                                f"Опубликовать сейчас: /postnow {pid}")
-            continue
-        retry = state.setdefault("post_retry", {})
-        if now - retry.get(pid, 0) < 600:  # a failing clip would re-upload 20 MB every poll otherwise
-            continue
-        retry[pid] = now
-        try:
-            mid = publish(p, state)
-            posted[pid] = mid
-            log("channel post", pid, mid)
-            notify_admin(state, f"Опубликовано в канале: {p['title']}\n{channel_link(mid)}")
-        except Exception as e:
-            log("channel post failed", pid, repr(e)[:300])
-            if pid not in failed:
-                failed.append(pid)
-                notify_admin(state, f"Не получилось опубликовать {pid} «{p['title']}»: {str(e)[:300]}\n"
-                                    "Проверьте, что бот — администратор канала с правом публиковать сообщения. "
-                                    "Бот будет пробовать снова каждые несколько минут.")
+        for c in channels():
+            key = f"{pid}{c['chat']}"
+            if key in posted:
+                continue
+            if now - t > LATE_LIMIT:
+                posted[key] = "missed"
+                notify_admin(state, f"Пост {pid} «{p['title']}» не вышел вовремя в {c['chat']} ({p['at']} МСК) "
+                                    f"и пропущен. Опубликовать сейчас: /postnow {pid}")
+                continue
+            if now - retry.get(key, 0) < 600:  # a failing post is retried every 10 minutes, not every poll
+                continue
+            retry[key] = now
+            try:
+                mid = publish(p, state, c["chat"], c["tag"])
+                posted[key] = mid
+                log("channel post", key, mid)
+                notify_admin(state, f"Опубликовано в {c['chat']}: {p['title']}\n{channel_link(c['chat'], mid)}")
+            except Exception as e:
+                log("channel post failed", key, repr(e)[:300])
+                if key not in failed:
+                    failed.append(key)
+                    notify_admin(state, f"Не получилось опубликовать {pid} «{p['title']}» в {c['chat']}: "
+                                        f"{str(e)[:300]}\nПроверьте, что бот — администратор этого канала с правом "
+                                        "публиковать сообщения. Бот будет пробовать снова каждые 10 минут.")
 
 
 def strip_html(t):
@@ -395,15 +411,16 @@ def strip_html(t):
 
 
 def plan(state):
-    posted, held, unheld = state.get("posted", {}), state.get("held", []), state.get("unheld", [])
+    posted, chans = state.get("posted", {}), channels()
     rows = []
     for p in POSTS["posts"]:
-        if p["id"] in posted:
+        if all(f"{p['id']}{c['chat']}" in posted for c in chans):
             continue
-        mark = "⏸ " if (p.get("hold") and p["id"] not in unheld) or p["id"] in held else ""
+        mark = "⏸ " if is_held(p, state) else ""
         rows.append(f"{p['id']}  {p['at'][5:]}  {mark}{p['title'][:45]}")
-    done = sum(1 for v in posted.values() if v != "missed")
-    return (f"Канал {POSTS['channel']}: опубликовано {done}, впереди {len(rows)}.\n⏸ — на паузе.\n\n"
+    done = ", ".join(f"{c['chat']}: {sum(1 for k, v in posted.items() if k.endswith(c['chat']) and v != 'missed')}"
+                     for c in chans)
+    return (f"Опубликовано — {done}. Впереди {len(rows)}.\n⏸ — на паузе.\n\n"
             + "\n".join(rows[:15]) + ("\n…" if len(rows) > 15 else "")
             + "\n\n/postnow p01 — опубликовать сейчас, /hold p01 — пауза, /unhold p01 — снять паузу")
 
@@ -442,12 +459,15 @@ def admin_post_cmd(text, chat, state):
         unheld.append(pid) if pid not in unheld else None
         call("sendMessage", chat_id=chat, text=f"{pid} снят с паузы и выйдет {p['at']} МСК")
     elif cmd == "/postnow":
-        try:
-            mid = publish(p, state)
-            state.setdefault("posted", {})[pid] = mid
-            call("sendMessage", chat_id=chat, text=f"Опубликовано: {channel_link(mid)}")
-        except Exception as e:
-            call("sendMessage", chat_id=chat, text=f"Не получилось: {str(e)[:300]}")
+        links = []
+        for c in channels():
+            try:
+                mid = publish(p, state, c["chat"], c["tag"])
+                state.setdefault("posted", {})[f"{pid}{c['chat']}"] = mid
+                links.append(channel_link(c["chat"], mid))
+            except Exception as e:
+                links.append(f"{c['chat']}: не получилось — {str(e)[:200]}")
+        call("sendMessage", chat_id=chat, text="Опубликовано:\n" + "\n".join(links))
 
 
 def handle(upd, state):

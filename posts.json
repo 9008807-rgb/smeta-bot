@@ -1,5 +1,14 @@
 {
- "channel": "@anyazheltakova",
+ "channels": [
+  {
+   "chat": "@anyazheltakova",
+   "tag": "tg"
+  },
+  {
+   "chat": "@M4manufacture",
+   "tag": "m4ch"
+  }
+ ],
  "posts": [
   {
    "id": "p01",
