@@ -12,7 +12,7 @@ for f in (bot.STATE_F, bot.LEADS_F):
     f.unlink(missing_ok=True)
 sent = []
 bot.call = lambda m, _http_timeout=70, **p: sent.append((m, p)) or {"document": {"file_id": "X"}}
-def fake_send(chat, path, cap, st, kind="document", markup=None, meta=None):
+def fake_send(chat, path, cap, st, kind="document", markup=None, meta=None, parse_mode=None):
     assert path.exists(), path
     sent.append(("send_" + kind, {"chat_id": chat, "file": path.name, "markup": markup}))
     return {kind: {"file_id": "X"}}
@@ -92,6 +92,65 @@ try:
 finally:
     mig.write_bytes(had_mig) if had_mig is not None else mig.unlink()
 print("backup + restore ok")
+
+# channel autopost: preview a day ahead, publish on time, holds, missed posts, failures reported once
+bot.POSTS = {"channel": "@chan", "posts": [
+    {"id": "p01", "at": "2026-10-26 12:00", "title": "Текст", "text": "<b>Привет</b>", "buttons": [["Смета", "https://t.me/x"]]},
+    {"id": "p02", "at": "2026-10-26 19:00", "title": "Клип", "text": "клип", "video": "05-tirazh.mp4",
+     "video_meta": {"duration": 44, "width": 1080, "height": 1920}, "buttons": []},
+    {"id": "p03", "at": "2026-10-27 12:00", "title": "Опрос", "poll": {"question": "Этап?", "options": ["А", "Б"]}, "buttons": []},
+    {"id": "p04", "at": "2026-10-27 13:00", "title": "Кейс", "text": "кейс", "hold": True, "buttons": []}]}
+stc = {"users": {}, "file_ids": {}, "admin_chats": [99]}
+sent.clear()
+bot.call = lambda m, _http_timeout=70, **p: sent.append((m, p)) or {"message_id": 500 + len(sent)}
+t01 = bot.post_time(bot.POSTS["posts"][0])
+assert time.strftime("%Y-%m-%d %H:%M", time.gmtime(t01 + 3 * 3600)) == "2026-10-26 12:00"
+bot.channel_posts(stc, now=t01 - 20 * 3600)                     # day before: previews only
+assert not stc["posted"] and stc["previewed"] == ["p01"]          # p02 is 27 h away: no preview yet
+assert any("Завтра в канале" in p.get("text", "") for m, p in sent)
+bot.channel_posts(stc, now=t01 + 60)                            # 12:01: the text goes out with HTML and a button
+m, p = next((m, p) for m, p in sent if p.get("chat_id") == "@chan")
+assert m == "sendMessage" and p["parse_mode"] == "HTML" and p["reply_markup"]["inline_keyboard"][0][0]["url"] == "https://t.me/x"
+assert "p01" in stc["posted"] and "p02" not in stc["posted"]
+assert any("t.me/chan/" in p.get("text", "") for m, p in sent)  # admins get the link
+bot.channel_posts(stc, now=bot.post_time(bot.POSTS["posts"][1]) + 60)
+assert any(m == "send_video" and p["chat_id"] == "@chan" for m, p in sent)
+t03 = bot.post_time(bot.POSTS["posts"][2])
+bot.channel_posts(stc, now=t03 + 60)
+poll = next(p for m, p in sent if m == "sendPoll")
+assert poll["options"] == [{"text": "А"}, {"text": "Б"}]
+bot.channel_posts(stc, now=t03 + 7200)                          # p04 is on hold: not published
+assert "p04" not in stc["posted"]
+assert "⏸" in bot.plan(stc) and "p04" in bot.plan(stc)
+bot.admin_post_cmd("/unhold p04", 99, stc)
+bot.channel_posts(stc, now=t03 + 7200)
+assert "p04" in stc["posted"]
+# a post that is 13 h late is reported, not published
+st2 = {"users": {}, "file_ids": {}, "admin_chats": [99]}
+bot.channel_posts(st2, now=t01 + 13 * 3600)
+assert st2["posted"]["p01"] == "missed"
+# failure: reported once, retried after 10 minutes
+st3 = {"users": {}, "file_ids": {}, "admin_chats": [99]}
+calls = []
+def failing(m, _http_timeout=70, **p):
+    calls.append((m, p.get("chat_id"), p.get("text", "")[:20]))
+    if p.get("chat_id") == "@chan":
+        raise RuntimeError("sendMessage: 403 bot is not a member of the channel chat")
+    return {"message_id": 1}
+bot.call = failing
+bot.channel_posts(st3, now=t01 + 60); bot.channel_posts(st3, now=t01 + 120)
+tries = lambda: sum(1 for c in calls if c[1] == "@chan")
+notices = lambda: sum(1 for c in calls if c[2].startswith("Не получилось"))
+assert tries() == 1 and notices() == 1 and st3["post_failed"] == ["p01"]   # retry waits 10 min, one notice
+bot.channel_posts(st3, now=t01 + 700)
+assert tries() == 2 and notices() == 1                                   # retried, no second notice
+print("channel autopost ok")
+# the real schedule parses and every clip file exists
+real = json.loads((bot.HERE / "posts.json").read_text(encoding="utf-8"))
+for p in real["posts"]:
+    bot.post_time(p)
+    assert not p.get("video") or (bot.HERE / "video" / p["video"]).exists(), p["video"]
+print("posts.json ok:", len(real["posts"]), "posts")
 print("sent followups user1:", st["users"]["1"]["sent"])
 print(bot.LEADS_F.read_text(encoding="utf-8-sig"))
 for f in (bot.STATE_F, bot.LEADS_F):

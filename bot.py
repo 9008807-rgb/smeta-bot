@@ -12,6 +12,9 @@
 - /admin_off       -> removes the chat from the recipients
 - /stats           -> admins only: leads by source and stage
 - /backup          -> admins only: sends state.json and leads.csv to the chat
+- channel autopost -> publishes posts.json (texts, clips, a poll) to the course channel at their Moscow time;
+                      admins get a preview a day before and a link after. The bot must be a channel admin
+                      allowed to post. /plan, /postnow <id>, /hold <id>, /unhold <id> for admins
 
 No third-party packages: plain Bot API over urllib, long polling. State lives in state.json, leads in leads.csv.
 
@@ -23,7 +26,7 @@ On the first start with an empty DATA_DIR the bot restores state and leads from 
 import csv, json, mimetypes, os, sys, time, urllib.error, urllib.parse, urllib.request, uuid
 from pathlib import Path
 
-VERSION = "v4 real file names"  # shows in the start log line: tells which code the host really runs
+VERSION = "v5 channel autopost"  # shows in the start log line: tells which code the host really runs
 HERE = Path(__file__).parent
 CFG = json.loads((HERE / "config.json").read_text(encoding="utf-8"))
 TOKEN = (os.environ.get("BOT_TOKEN") or (HERE / "token.txt").read_text(encoding="utf-8-sig")).strip()
@@ -35,6 +38,10 @@ DATA = Path(os.environ.get("DATA_DIR") or HERE)
 DATA.mkdir(parents=True, exist_ok=True)
 STATE_F, LEADS_F = DATA / "state.json", DATA / "leads.csv"
 TEXT = json.loads((HERE / "texts.json").read_text(encoding="utf-8"))
+_posts_f = HERE / "posts.json"
+POSTS = json.loads(_posts_f.read_text(encoding="utf-8")) if _posts_f.exists() else {"channel": "", "posts": []}
+MSK = 3 * 3600          # Moscow has no daylight saving; the host clock is UTC
+LATE_LIMIT = 12 * 3600  # a post more than 12 h late (bot was down) is reported, not published out of context
 sys.stdout.reconfigure(encoding="utf-8")
 
 
@@ -80,11 +87,13 @@ def call(method, _http_timeout=70, **params):
     return res["result"]
 
 
-def send_file(chat, path, caption, state, kind="document", markup=None, meta=None):
+def send_file(chat, path, caption, state, kind="document", markup=None, meta=None, parse_mode=None):
     """upload once, then reuse Telegram file_id; kind is "document" or "video".
     meta = {"duration", "width", "height"}: without it Telegram shows a video as 0:00 with a wrong frame"""
     method = "sendVideo" if kind == "video" else "sendDocument"
     extra = {k: str(v) for k, v in (meta or {}).items()}
+    if parse_mode:
+        extra["parse_mode"] = parse_mode
     if markup:
         extra["reply_markup"] = json.dumps(markup, ensure_ascii=False)
     fid = state["file_ids"].get(path.name)
@@ -300,6 +309,125 @@ def stats(state):
         "\n".join(f"{TEXT['objections'][k]['button']}: {v}" for k, v in by_obj.most_common()) or "—"))
 
 
+def post_time(p):
+    """posts.json time is Moscow wall clock 'YYYY-MM-DD HH:MM' -> unix time"""
+    import calendar
+    return calendar.timegm(time.strptime(p["at"], "%Y-%m-%d %H:%M")) - MSK
+
+
+def channel_link(msg_id):
+    ch = POSTS["channel"]
+    return f"https://t.me/{ch.lstrip('@')}/{msg_id}" if ch.startswith("@") else str(msg_id)
+
+
+def publish(p, state):
+    """send one scheduled post to the channel, return the message id"""
+    ch = POSTS["channel"]
+    markup = kb([[(t, u)] for t, u in p.get("buttons", [])]) if p.get("buttons") else None
+    if p.get("poll"):
+        r = call("sendPoll", chat_id=ch, question=p["poll"]["question"],
+                 options=[{"text": o} for o in p["poll"]["options"]], is_anonymous="true")
+    elif p.get("video_file_id"):
+        # clips live in Telegram (uploaded once by deploy/build_posts.py), not in the repo
+        extra = {"reply_markup": markup} if markup else {}
+        r = call("sendVideo", chat_id=ch, video=p["video_file_id"], caption=p["text"], parse_mode="HTML",
+                 supports_streaming="true", **{k: str(v) for k, v in p.get("video_meta", {}).items()}, **extra)
+    elif p.get("video"):
+        r = send_file(ch, HERE / "video" / p["video"], p["text"], state, "video", markup, p.get("video_meta"),
+                      parse_mode="HTML")
+    else:
+        extra = {"reply_markup": markup} if markup else {}
+        r = call("sendMessage", chat_id=ch, text=p["text"], parse_mode="HTML",
+                 link_preview_options={"is_disabled": True}, **extra)
+    return r["message_id"]
+
+
+def channel_posts(state, now=None):
+    """publish what is due, warn admins a day ahead, report failures once per post"""
+    now = now or time.time()
+    posted, held = state.setdefault("posted", {}), state.setdefault("held", [])
+    previewed, failed = state.setdefault("previewed", []), state.setdefault("post_failed", [])
+    for p in POSTS["posts"]:
+        pid = p["id"]
+        if pid in posted:
+            continue
+        on_hold = p.get("hold") and pid not in state.setdefault("unheld", []) or pid in held
+        t = post_time(p)
+        if t - now <= 24 * 3600 and pid not in previewed and now < t:
+            previewed.append(pid)
+            note = ("⚠️ Пост на паузе: нужны данные от Анны. Опубликовать: /unhold " + pid) if on_hold else \
+                   ("Снять с публикации: /hold " + pid)
+            notify_admin(state, f"Завтра в канале, {p['at']} МСК: {p['title']}\n\n{strip_html(p.get('text', ''))[:600]}"
+                                f"\n\n{note}")
+        if now < t or on_hold:
+            continue
+        if now - t > LATE_LIMIT:
+            posted[pid] = "missed"
+            notify_admin(state, f"Пост {pid} «{p['title']}» не вышел вовремя ({p['at']} МСК) и пропущен. "
+                                f"Опубликовать сейчас: /postnow {pid}")
+            continue
+        retry = state.setdefault("post_retry", {})
+        if now - retry.get(pid, 0) < 600:  # a failing clip would re-upload 20 MB every poll otherwise
+            continue
+        retry[pid] = now
+        try:
+            mid = publish(p, state)
+            posted[pid] = mid
+            log("channel post", pid, mid)
+            notify_admin(state, f"Опубликовано в канале: {p['title']}\n{channel_link(mid)}")
+        except Exception as e:
+            log("channel post failed", pid, repr(e)[:300])
+            if pid not in failed:
+                failed.append(pid)
+                notify_admin(state, f"Не получилось опубликовать {pid} «{p['title']}»: {str(e)[:300]}\n"
+                                    "Проверьте, что бот — администратор канала с правом публиковать сообщения. "
+                                    "Бот будет пробовать снова каждые несколько минут.")
+
+
+def strip_html(t):
+    import html, re
+    return html.unescape(re.sub(r"<[^>]+>", "", t))
+
+
+def plan(state):
+    posted, held, unheld = state.get("posted", {}), state.get("held", []), state.get("unheld", [])
+    rows = []
+    for p in POSTS["posts"]:
+        if p["id"] in posted:
+            continue
+        mark = "⏸ " if (p.get("hold") and p["id"] not in unheld) or p["id"] in held else ""
+        rows.append(f"{p['id']}  {p['at'][5:]}  {mark}{p['title'][:45]}")
+    done = sum(1 for v in posted.values() if v != "missed")
+    return (f"Канал {POSTS['channel']}: опубликовано {done}, впереди {len(rows)}.\n⏸ — на паузе.\n\n"
+            + "\n".join(rows[:15]) + ("\n…" if len(rows) > 15 else "")
+            + "\n\n/postnow p01 — опубликовать сейчас, /hold p01 — пауза, /unhold p01 — снять паузу")
+
+
+def admin_post_cmd(text, chat, state):
+    cmd, _, pid = text.partition(" ")
+    pid = pid.strip()
+    p = next((x for x in POSTS["posts"] if x["id"] == pid), None)
+    if not p:
+        call("sendMessage", chat_id=chat, text="Нет такого поста. Список: /plan")
+        return
+    held, unheld = state.setdefault("held", []), state.setdefault("unheld", [])
+    if cmd == "/hold":
+        held.append(pid) if pid not in held else None
+        unheld.remove(pid) if pid in unheld else None
+        call("sendMessage", chat_id=chat, text=f"{pid} на паузе, не выйдет, пока не пришлёте /unhold {pid}")
+    elif cmd == "/unhold":
+        held.remove(pid) if pid in held else None
+        unheld.append(pid) if pid not in unheld else None
+        call("sendMessage", chat_id=chat, text=f"{pid} снят с паузы и выйдет {p['at']} МСК")
+    elif cmd == "/postnow":
+        try:
+            mid = publish(p, state)
+            state.setdefault("posted", {})[pid] = mid
+            call("sendMessage", chat_id=chat, text=f"Опубликовано: {channel_link(mid)}")
+        except Exception as e:
+            call("sendMessage", chat_id=chat, text=f"Не получилось: {str(e)[:300]}")
+
+
 def handle(upd, state):
     if "callback_query" in upd:
         cq = upd["callback_query"]
@@ -340,6 +468,10 @@ def handle(upd, state):
                                                    f"Всего получателей: {len(admins(state))}. Отключить: /admin_off")
     elif text.startswith("/stats") and chat in admins(state):
         call("sendMessage", chat_id=chat, text=stats(state))
+    elif text.startswith("/plan") and chat in admins(state):
+        call("sendMessage", chat_id=chat, text=plan(state))
+    elif text.split(" ")[0] in ("/postnow", "/hold", "/unhold") and chat in admins(state):
+        admin_post_cmd(text, chat, state)
     elif text.startswith("/backup") and chat in admins(state):
         save_state(state)
         for p in (STATE_F, LEADS_F):
@@ -371,6 +503,7 @@ def main():
             if time.time() - last_fu > 300:
                 followups(state)
                 last_fu = time.time()
+            channel_posts(state)
             save_state(state)
         except Exception as e:
             log("loop error", repr(e)[:300])
