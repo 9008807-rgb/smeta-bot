@@ -154,7 +154,36 @@ def kb(rows):
                                  for t, d in row] for row in rows]}
 
 
+def is_ours(chat_id, name=""):
+    """our own team accounts (config "ours"): they test the bot and must not count as leads"""
+    ours = CFG.get("ours", {})
+    name = " ".join(str(name).replace("ё", "е").replace("Ё", "Е").split()).casefold()
+    return (int(chat_id) in ours.get("ids", [])
+            or any(n.replace("ё", "е").casefold() in name for n in ours.get("names", []) if name))
+
+
+def purge_ours(state):
+    """drop our team accounts from users and leads.csv (run at start; new rows are not written at all)"""
+    gone = [k for k, u in state["users"].items() if is_ours(u["id"], u.get("name", ""))]
+    for k in gone:
+        state["users"].pop(k)
+    if LEADS_F.exists():
+        with open(LEADS_F, newline="", encoding="utf-8-sig") as f:
+            rows = list(csv.reader(f, delimiter=";"))
+        keep = rows[:1] + [r for r in rows[1:] if len(r) < 4 or not is_ours(r[2], r[3])]
+        if len(keep) != len(rows):
+            with open(LEADS_F, "w", newline="", encoding="utf-8-sig") as f:
+                csv.writer(f, delimiter=";").writerows(keep)
+        gone_rows = len(rows) - len(keep)
+    else:
+        gone_rows = 0
+    if gone or gone_rows:
+        log("purged our contacts: %d users, %d lead rows" % (len(gone), gone_rows))
+
+
 def log_lead(u, event, extra=""):
+    if is_ours(u["id"], u.get("name", "")):
+        return
     new = not LEADS_F.exists()
     with open(LEADS_F, "a", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f, delimiter=";")
@@ -310,13 +339,13 @@ def followups(state):
 
 def stats(state):
     from collections import Counter
-    us = state["users"].values()
+    us = [u for u in state["users"].values() if not is_ours(u["id"], u.get("name", ""))]
     by_src = Counter(u.get("source", "?") for u in us)
     by_stage = Counter(u.get("stage", "не ответил") for u in us)
     by_obj = Counter(k for u in us for k in u.get("obj", []))
     consult = sum(1 for u in us if u.get("phone"))
     return ("Всего: %d, заявок на консультацию: %d\n\nИсточники:\n%s\n\nЭтапы:\n%s\n\nЧто пугает:\n%s" % (
-        len(state["users"]), consult,
+        len(us), consult,
         "\n".join(f"{k}: {v}" for k, v in by_src.most_common()),
         "\n".join(f"{TEXT['stages'].get(k, k)}: {v}" for k, v in by_stage.most_common()),
         "\n".join(f"{TEXT['objections'][k]['button']}: {v}" for k, v in by_obj.most_common()) or "—"))
@@ -497,7 +526,7 @@ BC_CHUNK = 25  # messages per loop turn; with getUpdates timeout 0 that is ~20/s
 def segment(state, key):
     out = []
     for u in state["users"].values():
-        if u.get("stopped"):
+        if u.get("stopped") or is_ours(u["id"], u.get("name", "")):
             continue
         src, stage = u.get("source", ""), u.get("stage", "")
         if (key == "all" or key == "new" and stage in ("dream", "idea", "samples") or key == "brand" and stage == "brand"
@@ -667,6 +696,8 @@ def main():
     me = call("getMe")
     restore_from_telegram()
     state = load_state()
+    purge_ours(state)
+    save_state(state)
     ig.init(log, notify_admin)
     set_admin_menu(state)
     log("bot @%s started (%s), data in %s, %d users" % (me["username"], VERSION, DATA, len(state["users"])))

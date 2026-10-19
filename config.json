@@ -1,6 +1,8 @@
 {
     "admins":  [519011391, 337624437],
     "admin_chat":  null,
+    "ours":  {"ids": [519011391, 337624437],
+              "names": ["Алексей Курышев", "Анна Желтакова", "Anya Zheltakova", "Бренд под ключ"]},
     "course_url":  "https://anna-zheltakova.com/course",
     "mastermind_url":  "https://anna-zheltakova.com/themastermind",
     "channel_url":  "https://t.me/anyazheltakova"

@@ -196,6 +196,21 @@ bot.handle({"message": {"chat": {"id": 99}, "from": {}, "text": "/broadcast"}}, 
 bot.handle({"message": {"chat": {"id": 99}, "from": {}, "text": "/cancel"}}, sb)
 assert "99" not in sb["bc_draft"]
 print("broadcast ok")
+# our own accounts (config "ours") are purged from users and leads, never logged, not counted, not broadcast to
+bot.CFG["ours"] = {"ids": [700], "names": ["Анна Желтакова", "Бренд под ключ"]}
+sp = {"users": {"700": {"id": 700, "name": "Anya"}, "701": {"id": 701, "name": "бренд под  ключ"},
+                "702": {"id": 702, "name": "Анна Жёлтакова 🌸"}, "703": {"id": 703, "name": "Мария"}}}
+bot.LEADS_F.write_text("время;событие;chat_id;имя;username;источник;этап;доп\n"
+                       "t;start;700;Anya;a;direct;;\nt;start;703;Мария;m;tg;;\nt;start;701;Бренд под ключ;b;direct;;\n",
+                       encoding="utf-8-sig")
+bot.purge_ours(sp)
+assert list(sp["users"]) == ["703"], sp["users"]
+assert [l.split(";")[2] for l in bot.LEADS_F.read_text(encoding="utf-8-sig").splitlines()[1:]] == ["703"]
+bot.log_lead({"id": 700, "name": "Anya"}, "start")
+assert "700" not in bot.LEADS_F.read_text(encoding="utf-8-sig")
+sp["users"]["700"] = {"id": 700, "name": "Anya"}
+assert bot.segment(sp, "all") == [703] and bot.stats(sp).startswith("Всего: 1,")
+print("our contacts purge ok")
 # the real schedule parses and every clip file exists
 real = json.loads((bot.HERE / "posts.json").read_text(encoding="utf-8"))
 for p in real["posts"]:
