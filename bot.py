@@ -12,6 +12,8 @@
 - /admin_off       -> removes the chat from the recipients
 - /stats           -> admins only: leads by source and stage
 - /backup          -> admins only: sends state.json and leads.csv to the chat
+- /migrate         -> admins only: hands state + leads to a new host (pinned smeta_migrate.json), then this copy
+                      stops polling for good; the new host started with WAIT_MIGRATION=1 picks the file up
 - channel autopost -> publishes posts.json (texts, clips, a poll) to the course channel at their Moscow time;
                       admins get a preview a day before and a link after. The bot must be a channel admin
                       allowed to post. /plan, /postnow <id>, /hold <id>, /unhold <id> for admins
@@ -34,7 +36,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))  # python -I leaves the script folder out of sys.path
 import instagram as ig  # noqa: E402
 
-VERSION = "v10 instagram"  # shows in the start log line: tells which code the host really runs
+VERSION = "v11 migrate"  # shows in the start log line: tells which code the host really runs
 HERE = Path(__file__).parent
 CFG = json.loads((HERE / "config.json").read_text(encoding="utf-8"))
 TOKEN = (os.environ.get("BOT_TOKEN") or (HERE / "token.txt").read_text(encoding="utf-8-sig")).strip()
@@ -67,6 +69,54 @@ def restore_from_telegram():
         with urllib.request.urlopen(f"https://api.telegram.org/file/bot{TOKEN}/{path}", timeout=120) as r:
             (DATA / name).write_bytes(r.read())
         log("restored", name)
+
+
+MIGRATE_NAME = "smeta_migrate.json"  # state + leads in one file, pinned in an admin chat by /migrate
+MIGRATED_F = DATA / "migrated"       # this copy handed over to a new host and must stay silent
+
+
+def restore_from_pin():
+    """new host (WAIT_MIGRATION=1): wait until the old copy pins smeta_migrate.json in an admin chat, then unpack it"""
+    if STATE_F.exists() or os.environ.get("WAIT_MIGRATION") != "1":
+        return
+    waited = 0
+    while True:
+        for chat in CFG.get("admins", []):
+            try:
+                doc = (call("getChat", chat_id=chat).get("pinned_message") or {}).get("document") or {}
+            except Exception as e:
+                log("getChat", chat, e)
+                continue
+            if doc.get("file_name") == MIGRATE_NAME:
+                path = call("getFile", file_id=doc["file_id"])["file_path"]
+                with urllib.request.urlopen(f"https://api.telegram.org/file/bot{TOKEN}/{path}", timeout=120) as r:
+                    bundle = json.load(r)
+                if bundle.get("leads"):
+                    LEADS_F.write_text(bundle["leads"], encoding="utf-8")
+                STATE_F.write_text(bundle["state"], encoding="utf-8")
+                log("restored state and leads from the pinned migration file in chat", chat)
+                return
+        if waited % 600 == 0:
+            log("waiting for /migrate on the old host (pinned %s)" % MIGRATE_NAME)
+        time.sleep(30)
+        waited += 30
+
+
+def migrate_out(chat, state):
+    """old host: pack state + leads, pin the file in this admin chat for the new host, then stop polling for good"""
+    save_state(state)
+    bundle = {"state": STATE_F.read_text(encoding="utf-8"),
+              "leads": LEADS_F.read_text(encoding="utf-8") if LEADS_F.exists() else ""}
+    path = DATA / MIGRATE_NAME
+    path.write_text(json.dumps(bundle, ensure_ascii=False), encoding="utf-8")
+    res = send_file(chat, path, "Перенос бота на сервер: база и заявки", {"file_ids": {}})
+    call("pinChatMessage", chat_id=chat, message_id=res["message_id"], disable_notification=True)
+    MIGRATED_F.write_text(time.strftime("%Y-%m-%d %H:%M:%S"), encoding="utf-8")
+    call("sendMessage", chat_id=chat, text="Готово: база передана, этот экземпляр бота остановлен. "
+                                           "Через минуту бот продолжит работу с нового сервера.")
+    log("migrated: this copy stops polling")
+    while True:
+        time.sleep(3600)
 
 
 def load_state():
@@ -679,6 +729,8 @@ def handle(upd, state):
         call("sendMessage", chat_id=chat, text=ig.plan(state))
     elif text.split(" ")[0] in ("/postnow", "/hold", "/unhold") and chat in admins(state):
         admin_post_cmd(text, chat, state)
+    elif text.startswith("/migrate") and chat in admins(state):
+        migrate_out(chat, state)
     elif text.startswith("/backup") and chat in admins(state):
         save_state(state)
         for p in (STATE_F, LEADS_F):
@@ -693,7 +745,12 @@ def handle(upd, state):
 
 
 def main():
+    if MIGRATED_F.exists():
+        log("this copy was migrated to another host on", MIGRATED_F.read_text(encoding="utf-8"), "- staying idle")
+        while True:
+            time.sleep(3600)
     me = call("getMe")
+    restore_from_pin()
     restore_from_telegram()
     state = load_state()
     purge_ours(state)
